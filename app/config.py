@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     GROQ_TIMEOUT_SECONDS: int
     LLM_TEMPERATURE: float
     LLM_MAX_TOKENS: int
+    LLM_CONSENSUS_ATTEMPTS: int
 
     # Logging
     LOG_LEVEL: str = "INFO"

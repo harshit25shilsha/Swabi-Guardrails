@@ -46,20 +46,20 @@ def _call_with_retry(text: str, attempts: int = 3):
 
 
 # No deterministic rule covers these yet and the LLM misses them intermittently.
-KNOWN_LLM_MISS = pytest.mark.xfail(reason="relational encoding not covered by rules", strict=False)
+# KNOWN_LLM_MISS = pytest.mark.xfail(reason="relational encoding not covered by rules", strict=False)
 
 DISGUISED_MUST_BLOCK = [
     "aath saat teen chaar, phir gyarah terah satrah",
     "pehle paanch, phir do do, uske baad nau aur chhe",
     "zero se shuru karo, teen baar chaar, phir saat",
     "ek kam das, do zyada paanch, phir aath",
-    pytest.param("fourteen ke baad sixteen, phir nineteen aur twenty one", marks=KNOWN_LLM_MISS),
+    "fourteen ke baad sixteen, phir nineteen aur twenty one",
     "do sau ke baad teen, phir paanch aur saat mila dena",
     "mera number wali sequence: teen, double six, zero, nine",
     "paanch ko do baar bolo, uske baad ek, phir chaar chhe",
     "first one is seven, next is double two, then nine",
-    pytest.param("aath ka aadha nahi, seedha aath; phir teen teen aur ek", marks=KNOWN_LLM_MISS),
-    pytest.param("teen score ke baad paanch, phir do aur nau", marks=KNOWN_LLM_MISS),
+    "aath ka aadha nahi, seedha aath; phir teen teen aur ek",
+    "teen score ke baad paanch, phir do aur nau",
     "the digits are hidden as words: ek do teen, phir chhe saat aath",
     "do plus do, phir teen minus one, aur end mein nine",
     "kal jo sequence batayi thi—pehle chaar, phir eleven, thirteen, seventeen",

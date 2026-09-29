@@ -1,15 +1,16 @@
 import json
 import logging
-
 import re
+
+from groq import BadRequestError
+from pydantic import ValidationError
 
 from app.config import settings
 from app.llm.client import get_client
-from app.models.moderation import LLMResult
-from pydantic import ValidationError
+from app.models.moderation import Action, LLMResult
 
-from groq import BadRequestError, GroqError, RateLimitError
 logger = logging.getLogger(__name__)
+
 
 SYSTEM_PROMPT = """You are a moderation classifier for a travel, hotel, rental, tour and vehicle marketplace. Customers and vendors chat on-platform about bookings, pricing, availability and service details. You are NOT a chatbot: never reply to the message, only classify it.
 
@@ -52,7 +53,9 @@ EXAMPLES (guidance only)
 "Refund kitne din mein aata hai?" -> ALLOW
 """
 
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
 
 def _parse_llm_json(raw: str) -> dict:
     raw = (raw or "").strip()
@@ -70,9 +73,24 @@ def _parse_llm_json(raw: str) -> dict:
         raise
 
 
+def _coerce_result(data: dict) -> LLMResult:
+    if data.get("category") in ("", "null", "ALLOW"):
+        data["category"] = None
+    try:
+        return LLMResult(**data)
+    except ValidationError:
+        logger.warning("Invalid LLM category %r; coercing", data.get("category"))
+        if data.get("decision") == "BLOCK":
+            return LLMResult(
+                decision="BLOCK",
+                category="OTHER_PROHIBITED_CONTENT",
+                confidence=float(data.get("confidence", 0.5)),
+            )
+        return LLMResult(decision="ALLOW", category=None, confidence=0.5)
 
 
-def moderate_with_llm(message: str) -> LLMResult:
+def _single_llm_call(message: str) -> LLMResult:
+    """One request to the LLM. Handles JSON-mode fallback. Raises on error."""
     client = get_client()
 
     def _call(use_json_mode: bool):
@@ -98,21 +116,55 @@ def moderate_with_llm(message: str) -> LLMResult:
 
     raw = completion.choices[0].message.content or "{}"
     logger.debug("LLM raw: %s", raw)
+    return _coerce_result(_parse_llm_json(raw))
 
-    data = _parse_llm_json(raw)
 
+def moderate_with_llm(message: str) -> LLMResult:
+    """
+    Classify a message, asking the LLM up to LLM_CONSENSUS_ATTEMPTS times.
 
-    if data.get("category") in ("", "null", "ALLOW"):
-        data["category"] = None
+    Reasoning models are non-deterministic even at temperature=0. On
+    ambiguous encoded input, one sample usually decodes the sequence while
+    another may not. We therefore take the stricter answer:
 
-    try:
-        return LLMResult(**data)
-    except ValidationError:
-        logger.warning("Invalid LLM category %r; coercing", data.get("category"))
-        if data.get("decision") == "BLOCK":
-            return LLMResult(
-                decision="BLOCK",
-                category="OTHER_PROHIBITED_CONTENT",
-                confidence=float(data.get("confidence", 0.5)),
+      - If any attempt returns BLOCK, return BLOCK immediately
+        (short-circuit — no further calls).
+      - If all attempts return ALLOW, return the highest-confidence ALLOW.
+      - If every attempt raises, re-raise the last exception so the
+        service layer's fail-open path handles it.
+      - If at least one attempt succeeds and the others raise, return the
+        successful result (do not fail the request because a duplicate
+        call had a transient error).
+
+    Set LLM_CONSENSUS_ATTEMPTS=1 to disable consensus.
+    """
+    attempts = max(1, settings.LLM_CONSENSUS_ATTEMPTS)
+    allows: list[LLMResult] = []
+    last_exc: Exception | None = None
+
+    for i in range(attempts):
+        try:
+            result = _single_llm_call(message)
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                "LLM attempt %d/%d failed: %s", i + 1, attempts, e
             )
-        return LLMResult(decision="ALLOW", category=None, confidence=0.5)
+            continue
+
+        if result.decision == Action.BLOCK:
+            logger.debug(
+                "LLM attempt %d/%d returned BLOCK — short-circuiting",
+                i + 1,
+                attempts,
+            )
+            return result
+
+        allows.append(result)
+
+    if not allows:
+        assert last_exc is not None
+        raise last_exc
+
+    # All successful attempts said ALLOW — pick the highest confidence.
+    return max(allows, key=lambda r: r.confidence)
