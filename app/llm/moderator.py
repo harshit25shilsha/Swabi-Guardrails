@@ -2,6 +2,8 @@ import json
 import logging
 import re
 
+import hashlib
+
 from groq import BadRequestError
 from pydantic import ValidationError
 
@@ -9,6 +11,9 @@ from app.config import settings
 from app.llm.client import get_client
 from app.models.moderation import Action, LLMResult
 
+from app.observability import counters
+
+from app.observability.circuit_breaker import CircuitBreaker, CircuitOpenError
 logger = logging.getLogger(__name__)
 
 
@@ -54,8 +59,17 @@ EXAMPLES (guidance only)
 """
 
 
+PROMPT_VERSION =  "marketplace_" + hashlib.sha256(
+    SYSTEM_PROMPT.encode("utf-8")
+).hexdigest()[:8]
+
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
+llm_circuit = CircuitBreaker(
+    failure_threshold=settings.LLM_CIRCUIT_FAILURE_THRESHOLD,
+    open_seconds=settings.LLM_CIRCUIT_OPEN_SECONDS,
+)
 
 def _parse_llm_json(raw: str) -> dict:
     raw = (raw or "").strip()
@@ -89,8 +103,11 @@ def _coerce_result(data: dict) -> LLMResult:
         return LLMResult(decision="ALLOW", category=None, confidence=0.5)
 
 
+
 def _single_llm_call(message: str) -> LLMResult:
-    """One request to the LLM. Handles JSON-mode fallback. Raises on error."""
+    
+    counters.increment("llm_calls_total")
+
     client = get_client()
 
     def _call(use_json_mode: bool):
@@ -109,35 +126,34 @@ def _single_llm_call(message: str) -> LLMResult:
         )
 
     try:
-        completion = _call(use_json_mode=True)
-    except BadRequestError as e:
-        logger.warning("JSON mode failed, retrying without it: %s", e)
-        completion = _call(use_json_mode=False)
+        try:
+            completion = _call(use_json_mode=True)
+        except BadRequestError as e:
+            logger.warning("JSON mode failed, retrying without it: %s", e)
+            completion = _call(use_json_mode=False)
 
-    raw = completion.choices[0].message.content or "{}"
-    logger.debug("LLM raw: %s", raw)
-    return _coerce_result(_parse_llm_json(raw))
+        raw = completion.choices[0].message.content or "{}"
+        logger.debug("LLM raw: %s", raw)
+        return _coerce_result(_parse_llm_json(raw))
+    except Exception:
+        counters.increment("llm_failures_total")
+        raise
+
 
 
 def moderate_with_llm(message: str) -> LLMResult:
     """
-    Classify a message, asking the LLM up to LLM_CONSENSUS_ATTEMPTS times.
+    Classify a message, respecting the circuit breaker and asking the LLM
+    up to LLM_CONSENSUS_ATTEMPTS times.
 
-    Reasoning models are non-deterministic even at temperature=0. On
-    ambiguous encoded input, one sample usually decodes the sequence while
-    another may not. We therefore take the stricter answer:
-
-      - If any attempt returns BLOCK, return BLOCK immediately
-        (short-circuit — no further calls).
-      - If all attempts return ALLOW, return the highest-confidence ALLOW.
-      - If every attempt raises, re-raise the last exception so the
-        service layer's fail-open path handles it.
-      - If at least one attempt succeeds and the others raise, return the
-        successful result (do not fail the request because a duplicate
-        call had a transient error).
-
-    Set LLM_CONSENSUS_ATTEMPTS=1 to disable consensus.
+    - If the circuit is open, raise CircuitOpenError immediately.
+    - BLOCK short-circuits (no further attempts).
+    - All attempts returning ALLOW → highest-confidence ALLOW.
+    - All attempts raising → record one circuit failure, re-raise.
     """
+    if not llm_circuit.allow_call():
+        raise CircuitOpenError("LLM circuit is open")
+
     attempts = max(1, settings.LLM_CONSENSUS_ATTEMPTS)
     allows: list[LLMResult] = []
     last_exc: Exception | None = None
@@ -153,18 +169,19 @@ def moderate_with_llm(message: str) -> LLMResult:
             continue
 
         if result.decision == Action.BLOCK:
+            llm_circuit.record_success()
             logger.debug(
                 "LLM attempt %d/%d returned BLOCK — short-circuiting",
-                i + 1,
-                attempts,
+                i + 1, attempts,
             )
             return result
 
         allows.append(result)
 
     if not allows:
+        llm_circuit.record_failure()
         assert last_exc is not None
         raise last_exc
 
-    # All successful attempts said ALLOW — pick the highest confidence.
+    llm_circuit.record_success()
     return max(allows, key=lambda r: r.confidence)

@@ -16,6 +16,8 @@ from app.policies.policy import apply_policy
 from app.detectors.number_words import detect_number_word_sequence
 from app.detectors.encoded_digits import detect_encoded_digits
 from app.detectors.arithmetic_digits import detect_arithmetic_digits
+from app.observability import counters
+from app.observability.circuit_breaker import CircuitOpenError
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ def moderate(raw_message: str) -> ModerationResponse:
                     action=Action.BLOCK,
                     category=category,
                     confidence=confidence,
+                    source="deterministic",
                 )
         except Exception:
             # A broken detector must not take the whole request down.
@@ -52,17 +55,28 @@ def moderate(raw_message: str) -> ModerationResponse:
     # 2) LLM layer.
     try:
         llm_result = moderate_with_llm(text)
-    except Exception:
-        # Day 1 documented fallback: FAIL OPEN.
-        # Rationale: with LLM down, we don't want to block every ambiguous
-        # message and break legitimate chat. A follow-up product decision
-        # can flip this to fail-closed for higher-risk flows.
-        logger.exception("LLM moderation failed; failing open")
+    except CircuitOpenError:
+        # Expected during a Groq outage - no traceback needed.
+        logger.warning("LLM circuit open; failing open")
+        counters.increment("fail_open_total")
         return ModerationResponse(
             allowed=True,
             action=Action.ALLOW,
             category=None,
             confidence=0.0,
+            source="fail_open",
+        )
+    except Exception:
+        
+        logger.exception("LLM moderation failed; failing open")
+        counters.increment("fail_open_total")
+        
+        return ModerationResponse(
+            allowed=True,
+            action=Action.ALLOW,
+            category=None,
+            confidence=0.0,
+            source="fail_open",
         )
 
     # 3) Policy layer — final decision.
@@ -72,4 +86,5 @@ def moderate(raw_message: str) -> ModerationResponse:
         action=action,
         category=category,
         confidence=confidence,
+        source="llm",
     )
