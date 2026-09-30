@@ -1,21 +1,20 @@
-import logging
+from fastapi import FastAPI, Request
 
-from fastapi import FastAPI
-
+from app.api.metrics import router as metrics_router
 from app.api.moderation import router as moderation_router
 from app.config import settings
+from app.observability.logging_setup import setup_logging
+from app.observability.middleware import ObservabilityMiddleware
 
-logging.basicConfig(level=settings.LOG_LEVEL.upper())
+setup_logging(level=settings.LOG_LEVEL, fmt=settings.LOG_FORMAT)
 
 app = FastAPI(
     title="Guardrail Service",
-    version="0.1.0",
+    version=settings.SERVICE_VERSION,
     description="Synchronous LLM-powered chat moderation layer for the marketplace.",
 )
 
-app.include_router(moderation_router)
+app.add_middleware(ObservabilityMiddleware)
 
-
-@app.get("/health", tags=["health"])
-def health() -> dict:
-    return {"status": "ok"}
+app.include_router(metrics_router)          # /health, /metrics
+app.include_router(moderation_router)       # /api/v1/validate-message
