@@ -5,17 +5,16 @@ from app.llm import moderator
 from app.observability import circuit_breaker as cbmod
 from app.observability.circuit_breaker import (
     CircuitBreaker,
-    CircuitOpenError,
     CircuitState,
 )
 
 
 @pytest.fixture(autouse=True)
-def _reset_circuit():
-    """Every test starts with the module-level circuit closed."""
-    moderator.llm_circuit.reset()
+def _reset_circuits():
+    """Every test starts with a clean provider circuit registry."""
+    moderator._provider_circuits.clear()
     yield
-    moderator.llm_circuit.reset()
+    moderator._provider_circuits.clear()
 
 
 # ---------- pure state-machine tests ----------
@@ -99,18 +98,27 @@ def test_half_open_only_one_probe_at_a_time(monkeypatch):
 
 # ---------- integration with the moderator ----------
 
-def test_moderate_with_llm_raises_when_circuit_open():
-    for _ in range(settings.LLM_CIRCUIT_FAILURE_THRESHOLD):
-        moderator.llm_circuit.record_failure()
-    with pytest.raises(CircuitOpenError):
+def test_moderate_with_llm_raises_when_all_circuits_open():
+    """
+    Open every provider circuit; moderate_with_llm must raise because
+    the provider ladder has nothing left to try.
+    """
+    for name in ("groq", "gemini"):
+        cb = moderator._get_circuit(name)
+        for _ in range(settings.LLM_CIRCUIT_FAILURE_THRESHOLD):
+            cb.record_failure()
+
+    with pytest.raises(Exception):
         moderator.moderate_with_llm("hello")
 
 
-def test_moderate_returns_fail_open_when_circuit_open():
+def test_moderate_returns_fail_open_when_all_circuits_open():
     from app.services.moderation import moderate
 
-    for _ in range(settings.LLM_CIRCUIT_FAILURE_THRESHOLD):
-        moderator.llm_circuit.record_failure()
+    for name in ("groq", "gemini"):
+        cb = moderator._get_circuit(name)
+        for _ in range(settings.LLM_CIRCUIT_FAILURE_THRESHOLD):
+            cb.record_failure()
 
     result = moderate("Platform fee jyada hai, kya discount milega?")
     assert result.allowed is True

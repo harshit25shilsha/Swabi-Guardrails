@@ -1,19 +1,16 @@
+import hashlib
 import json
 import logging
 import re
 
-import hashlib
-
-from groq import BadRequestError
 from pydantic import ValidationError
 
 from app.config import settings
-from app.llm.client import get_client
+from app.llm.providers import get_providers
 from app.models.moderation import Action, LLMResult
-
 from app.observability import counters
+from app.observability.circuit_breaker import CircuitBreaker
 
-from app.observability.circuit_breaker import CircuitBreaker, CircuitOpenError
 logger = logging.getLogger(__name__)
 
 
@@ -33,6 +30,7 @@ BLOCK when the message:
 - shares a URL or bare domain (EXTERNAL_URL);
 - shares payment details such as UPI IDs, bank/IFSC, card numbers or payment links (PAYMENT_INFORMATION);
 - proposes paying, booking or dealing outside the platform, or avoiding platform fees (OFF_PLATFORM_TRANSACTION);
+- lets meet somewhere off-platform (OFF_PLATFORM_COMMUNICATION);
 - otherwise tries to circumvent marketplace policy (OTHER_PROHIBITED_CONTENT).
 
 DISGUISED NUMBERS
@@ -59,17 +57,30 @@ EXAMPLES (guidance only)
 """
 
 
-PROMPT_VERSION =  "marketplace_" + hashlib.sha256(
+PROMPT_VERSION = "marketplace_" + hashlib.sha256(
     SYSTEM_PROMPT.encode("utf-8")
 ).hexdigest()[:8]
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
-llm_circuit = CircuitBreaker(
-    failure_threshold=settings.LLM_CIRCUIT_FAILURE_THRESHOLD,
-    open_seconds=settings.LLM_CIRCUIT_OPEN_SECONDS,
-)
+# One circuit per provider. Exposed to /metrics for operational visibility.
+_provider_circuits: dict[str, CircuitBreaker] = {}
+
+
+def _get_circuit(provider_name: str) -> CircuitBreaker:
+    if provider_name not in _provider_circuits:
+        _provider_circuits[provider_name] = CircuitBreaker(
+            failure_threshold=settings.LLM_CIRCUIT_FAILURE_THRESHOLD,
+            open_seconds=settings.LLM_CIRCUIT_OPEN_SECONDS,
+        )
+    return _provider_circuits[provider_name]
+
+
+def get_all_circuits() -> dict[str, CircuitBreaker]:
+    """Return the provider→circuit map. Used by /metrics."""
+    return _provider_circuits
+
 
 def _parse_llm_json(raw: str) -> dict:
     raw = (raw or "").strip()
@@ -79,11 +90,10 @@ def _parse_llm_json(raw: str) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Fallback: find the first {...} in the output
         start = raw.find("{")
         end = raw.rfind("}")
         if start != -1 and end > start:
-            return json.loads(raw[start : end + 1])
+            return json.loads(raw[start:end + 1])
         raise
 
 
@@ -103,85 +113,74 @@ def _coerce_result(data: dict) -> LLMResult:
         return LLMResult(decision="ALLOW", category=None, confidence=0.5)
 
 
+def _classify_with_fallback(message: str) -> tuple[LLMResult, str]:
+    """
+    Walk the provider ladder. Returns (result, provider_name).
+    Raises if every provider fails or is circuit-open.
+    """
+    providers = get_providers()
+    if not providers:
+        raise RuntimeError("no LLM providers configured")
 
-def _single_llm_call(message: str) -> LLMResult:
-    
-    counters.increment("llm_calls_total")
+    last_exc: Exception | None = None
+    for provider in providers:
+        circuit = _get_circuit(provider.name)
 
-    client = get_client()
+        if not circuit.allow_call():
+            logger.info(
+                "provider_skipped_circuit_open",
+                extra={"provider": provider.name},
+            )
+            continue
 
-    def _call(use_json_mode: bool):
-        kwargs = {}
-        if use_json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        return client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": message},
-            ],
-            temperature=settings.LLM_TEMPERATURE,
-            max_tokens=settings.LLM_MAX_TOKENS,
-            **kwargs,
-        )
-
-    try:
+        counters.increment("llm_calls_total")
+        counters.increment(f"llm_calls_by_provider:{provider.name}")
         try:
-            completion = _call(use_json_mode=True)
-        except BadRequestError as e:
-            logger.warning("JSON mode failed, retrying without it: %s", e)
-            completion = _call(use_json_mode=False)
+            raw = provider.classify(SYSTEM_PROMPT, message)
+            data = _parse_llm_json(raw)
+            result = _coerce_result(data)
+            circuit.record_success()
+            return result, provider.name
+        except Exception as e:
+            circuit.record_failure()
+            counters.increment("llm_failures_total")
+            counters.increment(f"llm_failures_by_provider:{provider.name}")
+            logger.warning(
+                "provider_failed",
+                extra={"provider": provider.name, "error": str(e)},
+            )
+            last_exc = e
+            continue
 
-        raw = completion.choices[0].message.content or "{}"
-        logger.debug("LLM raw: %s", raw)
-        return _coerce_result(_parse_llm_json(raw))
-    except Exception:
-        counters.increment("llm_failures_total")
-        raise
+    assert last_exc is not None
+    raise last_exc
 
 
-
-def moderate_with_llm(message: str) -> LLMResult:
+def moderate_with_llm(message: str) -> tuple[LLMResult, str]:
     """
-    Classify a message, respecting the circuit breaker and asking the LLM
-    up to LLM_CONSENSUS_ATTEMPTS times.
-
-    - If the circuit is open, raise CircuitOpenError immediately.
-    - BLOCK short-circuits (no further attempts).
-    - All attempts returning ALLOW → highest-confidence ALLOW.
-    - All attempts raising → record one circuit failure, re-raise.
+    Consensus retry across the provider ladder.
+    Returns (result, provider_name). BLOCK short-circuits.
     """
-    if not llm_circuit.allow_call():
-        raise CircuitOpenError("LLM circuit is open")
-
     attempts = max(1, settings.LLM_CONSENSUS_ATTEMPTS)
-    allows: list[LLMResult] = []
+    allows: list[tuple[LLMResult, str]] = []
     last_exc: Exception | None = None
 
     for i in range(attempts):
         try:
-            result = _single_llm_call(message)
+            result, provider = _classify_with_fallback(message)
         except Exception as e:
             last_exc = e
-            logger.warning(
-                "LLM attempt %d/%d failed: %s", i + 1, attempts, e
-            )
+            logger.warning("consensus attempt %d/%d failed", i + 1, attempts)
             continue
 
         if result.decision == Action.BLOCK:
-            llm_circuit.record_success()
-            logger.debug(
-                "LLM attempt %d/%d returned BLOCK — short-circuiting",
-                i + 1, attempts,
-            )
-            return result
-
-        allows.append(result)
+            return result, provider      # ← return tuple
+        allows.append((result, provider))
 
     if not allows:
-        llm_circuit.record_failure()
         assert last_exc is not None
         raise last_exc
 
-    llm_circuit.record_success()
-    return max(allows, key=lambda r: r.confidence)
+    # highest-confidence ALLOW, keep its provider
+    best_result, best_provider = max(allows, key=lambda rp: rp[0].confidence)
+    return best_result, best_provider

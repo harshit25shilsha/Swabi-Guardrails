@@ -48,6 +48,8 @@ class ModerationResponse(BaseModel):
     source: str = "unknown" # deterministic | llm | fail_open
     request_id: str=""
     prompt_version: str=""
+    provider: str=""        # groq | gemini
+    
 # ---- LLM structured output (internal only, never exposed) ----
 class LLMResult(BaseModel):
     decision: Action

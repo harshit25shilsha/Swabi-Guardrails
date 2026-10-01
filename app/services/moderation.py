@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Order matters. Email before URL so "@" forms are classified as EMAIL.
 # (Detector fn, category, confidence)
+
 _DETERMINISTIC_CHECKS = [
     (detect_phone,   ModerationCategory.PHONE_NUMBER,        0.99),
     (detect_number_word_sequence, ModerationCategory.PHONE_NUMBER, 0.80),
@@ -49,6 +50,7 @@ def moderate(raw_message: str) -> ModerationResponse:
                     category=category,
                     confidence=confidence,
                     source="deterministic",
+                    provider=""
                 )
         except Exception:
             # A broken detector must not take the whole request down.
@@ -56,7 +58,7 @@ def moderate(raw_message: str) -> ModerationResponse:
 
     # 2) LLM layer.
     try:
-        llm_result = moderate_with_llm(text)
+        llm_result, provider_name = moderate_with_llm(text)
     except CircuitOpenError:
         # Expected during a Groq outage - no traceback needed.
         logger.warning("LLM circuit open; failing open")
@@ -67,6 +69,7 @@ def moderate(raw_message: str) -> ModerationResponse:
             category=None,
             confidence=0.0,
             source="fail_open",
+            provider=""
         )
     except Exception:
         
@@ -79,6 +82,7 @@ def moderate(raw_message: str) -> ModerationResponse:
             category=None,
             confidence=0.0,
             source="fail_open",
+            provider=""
         )
 
     # 3) Policy layer — final decision.
@@ -89,4 +93,5 @@ def moderate(raw_message: str) -> ModerationResponse:
         category=category,
         confidence=confidence,
         source="llm",
+        provider=provider_name
     )

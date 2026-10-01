@@ -40,6 +40,18 @@ def snapshot() -> dict[str, Any]:
         for k, v in counters.items()
         if k.startswith("source:")
     }
+    
+    llm_calls_by_provider = {
+        k.split(":", 1)[1]: v
+        for k, v in counters.items()
+        if k.startswith("llm_calls_by_provider:")
+    }
+    
+    llm_failures_by_provider = {
+        k.split(":", 1)[1]: v
+        for k, v in counters.items()
+        if k.startswith("llm_failures_by_provider:")
+    }
 
     return {
         "requests_total": counters.get("requests_total", 0),
@@ -50,6 +62,8 @@ def snapshot() -> dict[str, Any]:
         "fail_open_total": counters.get("fail_open_total", 0),
         "blocks_by_category": blocks_by_category,
         "sources": sources,
+        "llm_calls_by_provider": llm_calls_by_provider,
+        "llm_failures_by_provider": llm_failures_by_provider,
         "latency_p95_ms": round(p95, 2),
     }
 
