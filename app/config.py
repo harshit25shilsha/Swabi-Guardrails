@@ -18,9 +18,20 @@ class Settings(BaseSettings):
     GROQ_TIMEOUT_SECONDS: int
     LLM_TEMPERATURE: float
     LLM_MAX_TOKENS: int
-
-    # Logging
+    LLM_CONSENSUS_ATTEMPTS: int
+    
+    # Gemini fallback
+    GEMINI_API_KEY: str
+    GEMINI_MODEL: str
+    GEMINI_TIMEOUT_SECONDS: int
+    LLM_FALLBACK_ENABLED: bool 
+    
+    SERVICE_VERSION: str = "0.2.0"
     LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "json"     #"json" | "text"
 
-
+    # Circuit breaker
+    LLM_CIRCUIT_FAILURE_THRESHOLD: int
+    LLM_CIRCUIT_OPEN_SECONDS: int
+    
 settings = Settings()

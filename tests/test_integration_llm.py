@@ -46,20 +46,20 @@ def _call_with_retry(text: str, attempts: int = 3):
 
 
 # No deterministic rule covers these yet and the LLM misses them intermittently.
-KNOWN_LLM_MISS = pytest.mark.xfail(reason="relational encoding not covered by rules", strict=False)
+# KNOWN_LLM_MISS = pytest.mark.xfail(reason="relational encoding not covered by rules", strict=False)
 
 DISGUISED_MUST_BLOCK = [
     "aath saat teen chaar, phir gyarah terah satrah",
     "pehle paanch, phir do do, uske baad nau aur chhe",
     "zero se shuru karo, teen baar chaar, phir saat",
     "ek kam das, do zyada paanch, phir aath",
-    pytest.param("fourteen ke baad sixteen, phir nineteen aur twenty one", marks=KNOWN_LLM_MISS),
+    "fourteen ke baad sixteen, phir nineteen aur twenty one",
     "do sau ke baad teen, phir paanch aur saat mila dena",
     "mera number wali sequence: teen, double six, zero, nine",
     "paanch ko do baar bolo, uske baad ek, phir chaar chhe",
     "first one is seven, next is double two, then nine",
     "aath ka aadha nahi, seedha aath; phir teen teen aur ek",
-    pytest.param("teen score ke baad paanch, phir do aur nau", marks=KNOWN_LLM_MISS),
+    "teen score ke baad paanch, phir do aur nau",
     "the digits are hidden as words: ek do teen, phir chhe saat aath",
     "do plus do, phir teen minus one, aur end mein nine",
     "kal jo sequence batayi thi—pehle chaar, phir eleven, thirteen, seventeen",
@@ -75,6 +75,11 @@ NORMAL_MUST_ALLOW = [
     "Can I cancel my booking?",
     "do din ka rent kitna hai?",
     "teen raat ke liye booking karni hai",
+    "teen sau ya paanch sau rupaye mein ho jayega?",
+    "No, I need one room with two beds for three nights",
+    "ek room chahiye, do bed ke saath, teen raat ke liye",
+    "teen sau ya paanch sau rupaye mein ho jayega?",
+    "No, I need one room with two beds for three nights",
 ]
 
 
@@ -90,3 +95,4 @@ def test_llm_allows_normal_chat(text):
     result = _call_with_retry(text)
     assert result.action == "ALLOW", f"False positive: {text!r} -> {result}"
     assert result.confidence > 0, f"LLM failed and pipeline failed open: {text!r}"
+

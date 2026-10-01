@@ -44,7 +44,12 @@ class ModerationResponse(BaseModel):
     category: Optional[ModerationCategory] = None
     confidence: float = Field(..., ge=0.0, le=1.0)
 
-
+    # for backend side logging
+    source: str = "unknown" # deterministic | llm | fail_open
+    request_id: str=""
+    prompt_version: str=""
+    provider: str=""        # groq | gemini
+    
 # ---- LLM structured output (internal only, never exposed) ----
 class LLMResult(BaseModel):
     decision: Action
